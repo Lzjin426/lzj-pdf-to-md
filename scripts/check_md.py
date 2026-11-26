@@ -206,6 +206,26 @@ def scan_file(path: str) -> dict:
         if len(TAG_CMD.findall(line)) > 1:
             double_tags.append(idx)
 
+    delim = [i for i, l in enumerate(lines) if l.strip().startswith("$$")]
+    formula_warnings = {
+        "delims": len(delim),
+        "unbalanced": len(delim) % 2 == 1,
+        "gap_after_open": [],
+        "double_close": [],
+    }
+    for pos, i in enumerate(delim):
+        stripped = lines[i].strip()
+        if stripped == "$$":
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j > i + 1 and j < len(lines) and lines[j].strip() and not lines[j].strip().startswith("$$"):
+                body = lines[j].strip()
+                if body[:1] in "+-−":
+                    formula_warnings["gap_after_open"].append(i + 1)
+        elif "tag" in stripped and pos + 1 < len(delim) and delim[pos + 1] - i <= 1:
+            formula_warnings["double_close"].append(i + 1)
+
     return {
         "counts": {
             "headings": headings,
@@ -215,12 +235,14 @@ def scan_file(path: str) -> dict:
             "table_grids": tables,
             "pipe_rows": pipe_rows,
             "math_tags": math_tags,
+            "formula_delims": len(delim),
         },
         "sublabels": sublabels,
         "caption_candidates": caption_candidates,
         "label_order_warnings": order_warnings,
         "artifacts": artifacts,
         "double_tag_lines": double_tags,
+        "formula_warnings": formula_warnings,
     }
 
 
@@ -229,6 +251,7 @@ def cmd_scan(args) -> int:
     total_sublabels = 0
     caption_suspects = 0
     order_warns = 0
+    formula_files = 0
     for path in iter_md(args.targets):
         info = scan_file(path)
         result[os.path.abspath(path)] = info
@@ -245,6 +268,19 @@ def cmd_scan(args) -> int:
                 print(f"  [{tag}] {name}:{cand['line']} {cand['text']}")
         for warn in info["label_order_warnings"]:
             print(f"  [标签顺序] {name}: 行 {warn['lines']} -> {warn['letters']}")
+        fw = info["formula_warnings"]
+        has_problem = fw["unbalanced"] or fw["gap_after_open"] or fw["double_close"]
+        if has_problem:
+            formula_files += 1
+        if has_problem or args.verbose:
+            detail = f"  [公式] {name}: 定界符 {fw['delims']} 行"
+            if fw["unbalanced"]:
+                detail += "，奇数不成对"
+            if fw["gap_after_open"]:
+                detail += f"，开 $$ 后空行 {fw['gap_after_open'][:10]}"
+            if fw["double_close"]:
+                detail += f"，多余收尾 $$ {fw['double_close'][:10]}"
+            print(detail)
 
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
@@ -253,7 +289,8 @@ def cmd_scan(args) -> int:
 
     print(
         f"\n扫描 {len(result)} 个文件 | 纯子图标签 {total_sublabels} 行 | "
-        f"未挂图的图注候选 {caption_suspects} 条 | 标签顺序告警 {order_warns} 处"
+        f"未挂图的图注候选 {caption_suspects} 条 | 标签顺序告警 {order_warns} 处 | "
+        f"公式异常文件 {formula_files} 个"
         + (f" | 快照 {args.json}" if args.json else "")
     )
     return 0
