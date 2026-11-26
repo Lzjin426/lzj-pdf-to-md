@@ -212,10 +212,14 @@ def scan_file(path: str) -> dict:
         "unbalanced": len(delim) % 2 == 1,
         "gap_after_open": [],
         "double_close": [],
+        "list_risk": [],
     }
     for pos, i in enumerate(delim):
         stripped = lines[i].strip()
         if stripped == "$$":
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if nxt[:2] in ("- ", "+ ") or re.match(r"\d{1,2}[.)]\s+(?![0-9])", nxt):
+                formula_warnings["list_risk"].append(i + 1)
             j = i + 1
             while j < len(lines) and not lines[j].strip():
                 j += 1
@@ -269,7 +273,9 @@ def cmd_scan(args) -> int:
         for warn in info["label_order_warnings"]:
             print(f"  [标签顺序] {name}: 行 {warn['lines']} -> {warn['letters']}")
         fw = info["formula_warnings"]
-        has_problem = fw["unbalanced"] or fw["gap_after_open"] or fw["double_close"]
+        has_problem = (
+            fw["unbalanced"] or fw["gap_after_open"] or fw["double_close"] or fw["list_risk"]
+        )
         if has_problem:
             formula_files += 1
         if has_problem or args.verbose:
@@ -280,6 +286,8 @@ def cmd_scan(args) -> int:
                 detail += f"，开 $$ 后空行 {fw['gap_after_open'][:10]}"
             if fw["double_close"]:
                 detail += f"，多余收尾 $$ {fw['double_close'][:10]}"
+            if fw["list_risk"]:
+                detail += f"，公式体以 -/+/序号开头会被当列表 {fw['list_risk'][:10]}"
             print(detail)
 
     if args.json:
