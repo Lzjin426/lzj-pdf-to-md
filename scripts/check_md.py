@@ -337,6 +337,146 @@ def cmd_fix_sublabels(args) -> int:
     return 0
 
 
+CAP_TAG = re.compile(r'data-quiet-caption="([^"]+)"')
+FIGCAP = re.compile(r"<figcaption[^>]*>(.*?)</figcaption>", re.S)
+CAP_START = re.compile(r"^(?:图|FIGURE|Figure)\s*[0-9A-Za-z]+")
+END_PUNCT = set("。．.；;！!？?，,、：:）)】」”\"'")
+CONNECTORS = {
+    "即", "或", "故", "于是", "而", "从而", "则", "若", "因", "且", "及", "得",
+    "代入", "解得", "故得", "故有", "所以", "因此", "其中", "由此", "由", "设", "取",
+    "当", "解", "如图", "见图", "式中", "例", "题",
+}
+
+
+def _norm_text(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
+def _flex_head(head: str):
+    return re.compile(r"\s*".join(re.escape(ch) for ch in head))
+
+
+def _is_caption_tail(line: str) -> bool:
+    s = line.strip()
+    if not 3 <= len(s) <= 14:
+        return False
+    if s in CONNECTORS:
+        return False
+    if s[0] in "0123456789（(§第*-":
+        return False
+    if s[-1] in END_PUNCT:
+        return False
+    if any(ch in s for ch in "，,、；;：:"):
+        return False
+    if s.startswith(("图", "FIGURE", "Figure")):
+        return False
+    if s.startswith(("思考题", "练习题", "习题", "小结", "本章", "参考文献", "附录", "目录", "前言")):
+        return False
+    return any("一" <= ch <= "鿿" for ch in s)
+
+
+def _already_in_caption(tail: str, cap: str) -> bool:
+    """候选续行里一半以上的汉字已经在图注里，说明是 OCR 换行重复，不算截断。"""
+    cap_chars = set(_norm_text(cap))
+    chars = [c for c in tail if "一" <= c <= "鿿"]
+    if not chars:
+        return True
+    return sum(1 for c in chars if c in cap_chars) / len(chars) >= 0.5
+
+
+def _page_lines(doc, idx, page_w):
+    lines = []
+    for blk in doc[idx].get_text("dict")["blocks"]:
+        for ln in blk.get("lines", []):
+            txt = "".join(sp["text"] for sp in ln["spans"]).strip()
+            if not txt:
+                continue
+            x0, _, x1, _ = ln["bbox"]
+            lines.append((txt, x0, x1, (x0 + x1) / 2))
+    return lines
+
+
+def _line_of(lines, needle):
+    for txt, x0, x1, mid in lines:
+        if needle and needle in txt:
+            return (txt, x0, x1, mid)
+    return None
+
+
+def cmd_caption_check(args) -> int:
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        print("caption-check 需要 PyMuPDF：pip install pymupdf", file=sys.stderr)
+        return 2
+    with open(args.md, encoding="utf-8", errors="replace") as fh:
+        md = fh.read()
+    caps = CAP_TAG.findall(md)
+    caps += [re.sub(r"<[^>]+>", "", x).strip() for x in FIGCAP.findall(md)]
+    caps = [c.strip() for c in caps if CAP_START.match(c.strip())]
+    doc = fitz.open(args.pdf)
+    raw_pages = [doc[i].get_text() for i in range(doc.page_count)]
+    norm_pages = [_norm_text(t) for t in raw_pages]
+    trunc, missing, ok = [], [], 0
+    line_cache = {}
+    for cap in caps:
+        key = _norm_text(cap)
+        if len(key) < 4:
+            continue
+        head = key[:8]
+        page_idx = None
+        for i, page in enumerate(norm_pages):
+            if head in page:
+                page_idx = i
+                break
+        if page_idx is None:
+            missing.append({"caption": cap, "page": None, "suggest": ""})
+            continue
+        raw = raw_pages[page_idx]
+        m = _flex_head(key).search(raw) or _flex_head(head).search(raw)
+        if not m:
+            missing.append({"caption": cap, "page": page_idx + 1, "suggest": ""})
+            continue
+        tail_of_line = raw[m.end():].split("\n")[0].strip()
+        suggest = ""
+        if not tail_of_line:
+            following = [l.strip() for l in raw[m.end():].split("\n")[1:8] if l.strip()]
+            for line in following[:4]:
+                if _is_caption_tail(line):
+                    suggest = line
+                    break
+                if len(line) > 14:
+                    break
+        if suggest:
+            page_w = doc[page_idx].rect.width
+            if page_idx not in line_cache:
+                line_cache[page_idx] = _page_lines(doc, page_idx, page_w)
+            lines = line_cache[page_idx]
+            cap_line = _line_of(lines, head[:6])
+            cand_line = _line_of(lines, suggest[:6])
+            if cap_line and cand_line:
+                left_margin = page_w * 0.12
+                if cand_line[1] < left_margin or abs(cand_line[3] - cap_line[3]) > page_w * 0.28:
+                    suggest = ""
+        if suggest and not _already_in_caption(suggest, cap):
+            trunc.append({"caption": cap, "page": page_idx + 1, "suggest": suggest})
+        else:
+            ok += 1
+    for item in trunc[: args.max_report]:
+        print(f"[疑似截断] p{item['page']} 「{item['caption']}」 → PDF 后接「{item['suggest']}」")
+    for item in missing[: args.max_report]:
+        where = f"p{item['page']}" if item["page"] else "未定位"
+        print(f"[未定位] {where} 「{item['caption']}」")
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({"captions": len(caps), "truncated": trunc, "missing": missing}, fh, ensure_ascii=False, indent=1)
+    print(
+        f"\n图注核对 {len(caps)} 条 | 完整 {ok} | 疑似截断 {len(trunc)} | 未定位 {len(missing)}"
+        + (f" | 明细 {args.json}" if args.json else "")
+    )
+    return 1 if (args.strict and trunc) else 0
+
+
 def cmd_verify(args) -> int:
     with open(args.before, encoding="utf-8") as fh:
         before = json.load(fh)["files"]
@@ -391,6 +531,14 @@ def main() -> int:
     p_verify.add_argument("targets", nargs="+")
     p_verify.add_argument("--before", required=True, help="scan 生成的快照 JSON")
     p_verify.set_defaults(func=cmd_verify)
+
+    p_cap = sub.add_parser("caption-check", help="用 PDF 文字层核对图注有没有被截断")
+    p_cap.add_argument("--md", required=True, help="Markdown 文件")
+    p_cap.add_argument("--pdf", required=True, help="原始 PDF")
+    p_cap.add_argument("--json", help="把明细写到这个文件")
+    p_cap.add_argument("--max-report", type=int, default=50, help="最多打印多少条")
+    p_cap.add_argument("--strict", action="store_true", help="发现疑似截断就以非零退出")
+    p_cap.set_defaults(func=cmd_caption_check)
 
     args = parser.parse_args()
     return args.func(args)
