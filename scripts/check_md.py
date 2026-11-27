@@ -340,6 +340,11 @@ def cmd_fix_sublabels(args) -> int:
 CAP_TAG = re.compile(r'data-quiet-caption="([^"]+)"')
 FIGCAP = re.compile(r"<figcaption[^>]*>(.*?)</figcaption>", re.S)
 CAP_START = re.compile(r"^(?:图|FIGURE|Figure)\s*[0-9A-Za-z]+")
+CAP_NUM = re.compile(r"^(图|FIGURE|Figure)\s*([0-9]+)\s*[-–]\s*([0-9]+)\s*(.*)$")
+REF_AFTER = ("所示", "为", "中", "是", "可见", "所", "给", "与", "和", "沿", "在", "的", "及", "，", ",", "、")
+BAD_START = tuple("0123456789①②③④⑤⑥⑦⑧⑨⑩（(§第*图表")
+BAD_WORD = ("思考题", "练习题", "习题", "小结", "本节", "例题")
+BODY_START = ("所示", "如图", "图中", "可见", "则", "故", "可知", "这说明", "由于", "因此")
 END_PUNCT = set("。．.；;！!？?，,、：:）)】」”\"'")
 CONNECTORS = {
     "即", "或", "故", "于是", "而", "从而", "则", "若", "因", "且", "及", "得",
@@ -403,6 +408,17 @@ def _line_of(lines, needle):
     return None
 
 
+def _page_lines(doc, idx):
+    out = []
+    for blk in doc[idx].get_text("dict")["blocks"]:
+        for ln in blk.get("lines", []):
+            txt = "".join(sp["text"] for sp in ln["spans"]).strip()
+            if txt:
+                x0, _, x1, _ = ln["bbox"]
+                out.append((txt, x0, x1))
+    return out
+
+
 def cmd_caption_check(args) -> int:
     try:
         import fitz  # PyMuPDF
@@ -411,69 +427,89 @@ def cmd_caption_check(args) -> int:
         return 2
     with open(args.md, encoding="utf-8", errors="replace") as fh:
         md = fh.read()
-    caps = CAP_TAG.findall(md)
-    caps += [re.sub(r"<[^>]+>", "", x).strip() for x in FIGCAP.findall(md)]
-    caps = [c.strip() for c in caps if CAP_START.match(c.strip())]
+    caps = []
+    for raw in CAP_TAG.findall(md):
+        raw = raw.strip()
+        m = CAP_NUM.match(raw)
+        if m:
+            caps.append((f"{m.group(1)}{m.group(2)}-{m.group(3)}", raw))
     doc = fitz.open(args.pdf)
-    raw_pages = [doc[i].get_text() for i in range(doc.page_count)]
-    norm_pages = [_norm_text(t) for t in raw_pages]
-    trunc, missing, ok = [], [], 0
-    line_cache = {}
-    for cap in caps:
-        key = _norm_text(cap)
-        if len(key) < 4:
-            continue
-        head = key[:8]
-        page_idx = None
-        for i, page in enumerate(norm_pages):
-            if head in page:
-                page_idx = i
+    page_w = doc[0].rect.width
+    pages = [_page_lines(doc, i) for i in range(doc.page_count)]
+
+    def overlap(a, b):
+        return max(0, min(a[2], b[2]) - max(a[0], b[0]))
+
+    trunc, missed, ok = [], [], 0
+    for num, raw in caps:
+        key = _norm_text(num)
+        md_text = _norm_text(raw)[len(key):]
+        hit = None
+        for mode in ("start", "contain"):
+            for pi, lines in enumerate(pages):
+                best = None
+                for k, (t, x0, x1) in enumerate(lines):
+                    nt = _norm_text(t)
+                    if "…" in t or ".." in t:
+                        continue
+                    if mode == "start":
+                        if not nt.startswith(key) or len(nt) <= len(key):
+                            continue
+                        idx = 0
+                    else:
+                        idx = nt.find(key)
+                        if idx < 0 or len(nt) <= len(key):
+                            continue
+                    rest = nt[idx + len(key):]
+                    if rest[:1] in "，,、。;；":
+                        continue
+                    if any(rest.startswith(w) for w in REF_AFTER):
+                        continue
+                    width = x1 - x0
+                    if width <= page_w * 0.6 and (best is None or width < best[0]):
+                        best = (width, k, t, (x0, x1), lines, idx)
+                if best:
+                    hit = (pi, best)
+                    break
+            if hit:
                 break
-        if page_idx is None:
-            missing.append({"caption": cap, "page": None, "suggest": ""})
+        if not hit:
+            missed.append({"caption": raw, "page": None})
             continue
-        raw = raw_pages[page_idx]
-        m = _flex_head(key).search(raw) or _flex_head(head).search(raw)
-        if not m:
-            missing.append({"caption": cap, "page": page_idx + 1, "suggest": ""})
-            continue
-        tail_of_line = raw[m.end():].split("\n")[0].strip()
-        suggest = ""
-        if not tail_of_line:
-            following = [l.strip() for l in raw[m.end():].split("\n")[1:8] if l.strip()]
-            for line in following[:4]:
-                if _is_caption_tail(line):
-                    suggest = line
-                    break
-                if len(line) > 14:
-                    break
-        if suggest:
-            page_w = doc[page_idx].rect.width
-            if page_idx not in line_cache:
-                line_cache[page_idx] = _page_lines(doc, page_idx, page_w)
-            lines = line_cache[page_idx]
-            cap_line = _line_of(lines, head[:6])
-            cand_line = _line_of(lines, suggest[:6])
-            if cap_line and cand_line:
-                left_margin = page_w * 0.12
-                if cand_line[1] < left_margin or abs(cand_line[3] - cap_line[3]) > page_w * 0.28:
-                    suggest = ""
-        if suggest and not _already_in_caption(suggest, cap):
-            trunc.append({"caption": cap, "page": page_idx + 1, "suggest": suggest})
+        pi, (_, k, t, box, lines, idx) = hit
+        got = _norm_text(t)[idx + len(key):]
+        tail = ""
+        for j in range(k + 1, min(k + 5, len(lines))):
+            nt, x0, x1 = lines[j]
+            nn = _norm_text(nt)
+            cap_w = max(box[1] - box[0], 1)
+            same_column = (
+                overlap((box[0], 0, box[1], 0), (x0, 0, x1, 0)) >= 0.35 * cap_w
+                or abs((x0 + x1) / 2 - (box[0] + box[1]) / 2) <= 0.6 * max(cap_w, 80)
+            )
+            if not same_column:
+                continue
+            if nn.startswith(BAD_START) or any(w in nn for w in BAD_WORD):
+                break
+            if nn.startswith(BODY_START):
+                break
+            if len(nn) > 18 or nn[-1] in "。；，,、":
+                break
+            tail += nn
+        got += tail
+        if md_text and len(got) >= len(md_text) + 3 and len(got) / len(md_text) >= 1.25:
+            trunc.append({"caption": raw, "page": pi + 1, "pdf_text": got, "suggest": tail})
         else:
             ok += 1
     for item in trunc[: args.max_report]:
-        print(f"[疑似截断] p{item['page']} 「{item['caption']}」 → PDF 后接「{item['suggest']}」")
-    for item in missing[: args.max_report]:
-        where = f"p{item['page']}" if item["page"] else "未定位"
-        print(f"[未定位] {where} 「{item['caption']}」")
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump({"captions": len(caps), "truncated": trunc, "missing": missing}, fh, ensure_ascii=False, indent=1)
+        print(f"[疑似截断] p{item['page']} 「{item['caption']}」 → PDF 全文「{item['pdf_text'][:40]}」")
     print(
-        f"\n图注核对 {len(caps)} 条 | 完整 {ok} | 疑似截断 {len(trunc)} | 未定位 {len(missing)}"
+        f"\n图注核对 {len(caps)} 条 | 完整 {ok} | 疑似截断 {len(trunc)} | 未定位 {len(missed)}"
         + (f" | 明细 {args.json}" if args.json else "")
     )
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({"captions": len(caps), "truncated": trunc, "missing": missed}, fh, ensure_ascii=False, indent=1)
     return 1 if (args.strict and trunc) else 0
 
 
